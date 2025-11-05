@@ -55,3 +55,9 @@ secrets*.json
 
 # --- Project-specific artifacts ---
 downloads/
+
+# Ignore data and outputs
+data/raw_pdfs/
+data/extracted_text/
+outputs/
+
