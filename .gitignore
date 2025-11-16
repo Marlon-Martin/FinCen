@@ -61,12 +61,4 @@ data/raw_pdfs/
 data/extracted_text/
 outputs/
 
-# FinCEN data/artifacts
-fincen_advisories.csv
-fincen_fraud_mapping.csv
-fincen_fraud_mapping_details.json
-fincen_keyword_locations.csv
-fincen_semantic_chunks.csv
-embed_cache.json
-processing_state.json
-fincen_advisory_pdfs/
+
