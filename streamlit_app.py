@@ -12,6 +12,9 @@ Views:
   2) Semantic Search
      - Embedding-based search over pre-chunked FinCEN texts stored locally
        in vecstore/ (built via build_vectorstore.py).
+
+  3) FinCEN Insights
+     - High-level narrative + simple analytics over recent FinCEN publications.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 import json
+from datetime import datetime, timedelta  # NEW: for time-window filtering
 
 from supabase_helpers import get_supabase_client
 from semantic_search import search as semantic_search  # NEW: semantic search API
@@ -85,7 +89,7 @@ def load_data_from_supabase() -> pd.DataFrame:
       - high_level_summary
       - primary_fraud_families (list)
       - secondary_fraud_families (list)
-      - specific_schemes (list[dict])
+      - specific_schemes (list[dict] or list[str])
       - key_red_flags (list[str])
     """
     client = get_supabase_client()
@@ -850,6 +854,345 @@ def tab_semantic_search():
 
 
 # ---------------------------------------------------------------------------
+# Insights tab
+# ---------------------------------------------------------------------------
+
+
+def _extract_scheme_labels(val: Any) -> List[str]:
+    """
+    Normalize specific_schemes into a flat list of scheme labels.
+
+    Handles:
+      - list of dicts with 'scheme_label' / 'label' / 'name'
+      - list of strings
+      - JSON-encoded strings
+      - semicolon / pipe separated strings
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return []
+
+    # Already a list
+    if isinstance(val, list):
+        labels: List[str] = []
+        for item in val:
+            if isinstance(item, dict):
+                label = (
+                    item.get("scheme_label")
+                    or item.get("label")
+                    or item.get("name")
+                )
+                if label:
+                    labels.append(str(label).strip())
+            elif isinstance(item, str):
+                s = item.strip()
+                if s:
+                    labels.append(s)
+        return labels
+
+    # Try JSON decode from string
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            return _extract_scheme_labels(parsed)
+        except Exception:
+            # Fallback: split on common separators
+            parts = [p.strip() for p in s.replace(";", "|").split("|")]
+            return [p for p in parts if p]
+
+    # Fallback: single value
+    return [str(val).strip()]
+
+
+def tab_fincen_insights(docs_df: pd.DataFrame):
+    """
+    FinCEN Insights tab
+
+    Uses only the fincen_llm_summaries-derived columns inside docs_df to:
+      - filter by recent time window,
+      - aggregate fraud families, schemes, red flags,
+      - detect simple "emerging" schemes,
+      - and build a narrative summary plus visuals.
+    """
+    st.subheader("FinCEN Insights")
+
+    st.markdown(
+        """
+        This tab gives a **quick narrative overview** of recent FinCEN Advisories,
+        Alerts, and Notices based on the LLM summaries stored in Supabase.
+
+        Use it to see:
+        - Which **fraud families** are most active,
+        - Which **schemes** keep showing up,
+        - What **red flags** are repeated across documents,
+        - And which **documents** are most notable in the selected period.
+        """
+    )
+
+    # --- Step 1: Time-window selector ---
+    window_label = st.selectbox(
+        "Time window",
+        options=[
+            "Last 1 Month",
+            "Last 3 Months",
+            "Last 6 Months",
+            "Last 1 Year",
+        ],
+        index=1,  # default: Last 3 Months
+    )
+    days_lookup = {
+        "Last 1 Month": 30,
+        "Last 3 Months": 90,
+        "Last 6 Months": 180,
+        "Last 1 Year": 365,
+    }
+    days = days_lookup[window_label]
+
+    today = datetime.now()
+    cutoff_date = today - timedelta(days=days)
+
+    # Ensure doc_date_parsed exists
+    if "doc_date_parsed" not in docs_df.columns:
+        docs_df["doc_date_parsed"] = pd.to_datetime(
+            docs_df.get("doc_date"), errors="coerce"
+        )
+
+    df_recent = docs_df[
+        docs_df["doc_date_parsed"].notna()
+        & (docs_df["doc_date_parsed"] >= cutoff_date)
+    ].copy()
+
+    st.markdown(
+        f"**Window:** {window_label} "
+        f"({df_recent['doc_key'].nunique()} documents in this period)"
+    )
+
+    if df_recent.empty:
+        st.warning("No FinCEN publications fall in this time window.")
+        return
+
+    # --- Step 2: Simple analytics: families, schemes, red flags ---
+
+    # Fraud families (use union of primary + secondary, already in all_families)
+    fam_series_recent = (
+        df_recent["all_families"]
+        .apply(_ensure_list)
+        .explode()
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+    fam_series_recent = fam_series_recent[fam_series_recent != ""]
+    family_counts_recent = fam_series_recent.value_counts()
+
+    fam_series_all = (
+        docs_df["all_families"]
+        .apply(_ensure_list)
+        .explode()
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+    fam_series_all = fam_series_all[fam_series_all != ""]
+    family_counts_all = fam_series_all.value_counts()
+
+    # Schemes
+    df_recent = df_recent.copy()
+    df_recent["__scheme_labels"] = df_recent["specific_schemes"].apply(
+        _extract_scheme_labels
+    )
+    scheme_series_recent = (
+        df_recent["__scheme_labels"].explode().dropna().astype(str).str.strip()
+    )
+    scheme_series_recent = scheme_series_recent[scheme_series_recent != ""]
+    scheme_counts_recent = scheme_series_recent.value_counts()
+
+    docs_df = docs_df.copy()
+    docs_df["__scheme_labels"] = docs_df["specific_schemes"].apply(
+        _extract_scheme_labels
+    )
+    scheme_series_all = (
+        docs_df["__scheme_labels"].explode().dropna().astype(str).str.strip()
+    )
+    scheme_series_all = scheme_series_all[scheme_series_all != ""]
+    scheme_counts_all = scheme_series_all.value_counts()
+
+    # Red flags
+    flags_series_recent = (
+        df_recent["key_red_flags"]
+        .apply(_ensure_list)
+        .explode()
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+    flags_series_recent = flags_series_recent[flags_series_recent != ""]
+    redflag_counts_recent = flags_series_recent.value_counts()
+
+    # Emerging schemes: appear only / disproportionately in recent window
+    emerging_schemes = []
+    for scheme, recent_count in scheme_counts_recent.items():
+        total_count = scheme_counts_all.get(scheme, 0)
+        if total_count == 0:
+            continue
+        # Very simple rule: at least 50% of all occurrences are in this window
+        if recent_count / total_count >= 0.5:
+            emerging_schemes.append(scheme)
+
+    # --- Step 3: Narrative summary ---
+
+    top_families_list = list(family_counts_recent.head(3).index)
+    top_schemes_list = list(scheme_counts_recent.head(5).index)
+    top_flags_list = list(redflag_counts_recent.head(5).index)
+
+    narrative_lines = []
+
+    narrative_lines.append(
+        f"In the **{window_label.lower()}**, FinCEN published "
+        f"**{df_recent['doc_key'].nunique()}** documents."
+    )
+
+    if top_families_list:
+        narrative_lines.append(
+            f"- The most frequently cited **fraud families** were "
+            f"**{', '.join(top_families_list)}**."
+        )
+
+    if top_schemes_list:
+        narrative_lines.append(
+            f"- Key **schemes** included "
+            f"**{', '.join(top_schemes_list)}**."
+        )
+
+    if emerging_schemes:
+        narrative_lines.append(
+            f"- Potentially **emerging schemes** (heavily concentrated in this window) "
+            f"include **{', '.join(emerging_schemes[:5])}**."
+        )
+
+    if top_flags_list:
+        narrative_lines.append(
+            f"- Repeated **red flags** across multiple publications include "
+            f"**{', '.join(top_flags_list)}**."
+        )
+
+    narrative_lines.append(
+        "These patterns can help analysts prioritize monitoring, SAR reviews, "
+        "and outreach around the most active fraud types and typologies."
+    )
+
+    st.markdown("### Narrative Summary")
+    st.markdown("\n".join(narrative_lines))
+
+    # --- Step 4: Visuals ---
+
+    col_fam, col_scheme = st.columns(2)
+
+    with col_fam:
+        st.markdown("#### Top Fraud Families (by doc frequency)")
+        if not family_counts_recent.empty:
+            fam_df = (
+                family_counts_recent.head(10)
+                .reset_index()
+                .rename(columns={"index": "Fraud family", 0: "count", "all_families": "count"})
+            )
+            fam_df.columns = ["Fraud family", "count"]
+            chart = (
+                alt.Chart(fam_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("count:Q", title="Number of mentions"),
+                    y=alt.Y("Fraud family:N", sort="-x", title="Fraud family"),
+                    tooltip=["Fraud family", "count"],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("No fraud family labels found in this window.")
+
+    with col_scheme:
+        st.markdown("#### Top Schemes")
+        if not scheme_counts_recent.empty:
+            scheme_df = (
+                scheme_counts_recent.head(10)
+                .reset_index()
+                .rename(columns={"index": "Scheme", 0: "count", "__scheme_labels": "count"})
+            )
+            scheme_df.columns = ["Scheme", "count"]
+            st.dataframe(scheme_df, use_container_width=True)
+        else:
+            st.info("No scheme labels found in this window.")
+
+    st.markdown("#### Repeated Red Flags")
+    if not redflag_counts_recent.empty:
+        flags_df = (
+            redflag_counts_recent.head(10)
+            .reset_index()
+            .rename(columns={"index": "Red flag", 0: "count", "key_red_flags": "count"})
+        )
+        flags_df.columns = ["Red flag", "count"]
+        st.dataframe(flags_df, use_container_width=True)
+    else:
+        st.info("No red flags found in this window.")
+
+    # --- Step 5: Notable documents list ---
+
+    st.markdown("### Notable Documents in This Window")
+
+    # Simple heuristic: sort by date desc, then by #families+schemes desc
+    df_recent = df_recent.copy()
+    df_recent["__num_families"] = df_recent["all_families"].apply(
+        lambda x: len(_ensure_list(x))
+    )
+    df_recent["__num_schemes"] = df_recent["__scheme_labels"].apply(
+        lambda x: len(_ensure_list(x))
+    )
+    df_recent["__score"] = df_recent["__num_families"] + df_recent["__num_schemes"]
+
+    df_notable = (
+        df_recent.sort_values(
+            ["__score", "doc_date_parsed"],
+            ascending=[False, False],
+            na_position="last",
+        )
+        .reset_index(drop=True)
+    )
+
+    # Show top 10 "richest" documents
+    for _, row in df_notable.head(10).iterrows():
+        title = row.get("doc_title") or row.get("doc_key")
+        doc_date = row.get("doc_date_parsed") or row.get("doc_date")
+        doc_type = row.get("doc_type") or ""
+        fincen_id = row.get("fincen_id")
+
+        header_line = f"**{title}**"
+        meta_bits = []
+        if isinstance(doc_date, pd.Timestamp) and not pd.isna(doc_date):
+            meta_bits.append(f"*Date:* {doc_date.date()}")
+        elif doc_date:
+            meta_bits.append(f"*Date:* {doc_date}")
+        if doc_type:
+            meta_bits.append(f"*Type:* {doc_type}")
+        if fincen_id:
+            meta_bits.append(f"*FinCEN ID:* `{fincen_id}`")
+
+        st.markdown(header_line)
+        if meta_bits:
+            st.markdown(" • ".join(meta_bits))
+
+        summary_text = row.get("high_level_summary")
+        if summary_text and isinstance(summary_text, str) and summary_text.strip():
+            st.write(summary_text.strip())
+        else:
+            st.write("_No high-level summary available for this document._")
+
+        st.markdown("---")
+
+
+# ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
 
@@ -861,7 +1204,8 @@ def main():
         """
         This app visualizes FinCEN Advisories, Alerts, and Notices using
         **fraud families** extracted from the LLM summaries stored in Supabase,
-        and adds an **embedding-based semantic search** view over chunked text.
+        adds an **embedding-based semantic search** view over chunked text,
+        and a **FinCEN Insights** tab for quick, narrative trend analysis.
         """
     )
 
@@ -873,10 +1217,17 @@ def main():
         )
         return
 
-    # Tabs: Timeline vs Semantic Search
-    tab1, tab2 = st.tabs(["Fraud Families Timeline", "Semantic Search"])
+    # Tabs: Insights (first) → Timeline → Semantic Search
+    tab1, tab2, tab3 = st.tabs(
+        ["FinCEN Insights", "Fraud Families Timeline", "Semantic Search"]
+    )
 
+    # --- Tab 1: Insights ---
     with tab1:
+        tab_fincen_insights(docs_df)
+
+    # --- Tab 2: Timeline + drill-down ---
+    with tab2:
         # Build filters FIRST (including the primary vs primary+secondary toggle)
         filters = sidebar_filters(docs_df)
 
@@ -897,7 +1248,8 @@ def main():
         else:
             tab_fraud_families_over_time(exploded, filters)
 
-    with tab2:
+    # --- Tab 3: Semantic Search ---
+    with tab3:
         tab_semantic_search()
 
 
