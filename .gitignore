@@ -25,6 +25,7 @@ env/
 .hypothesis/
 .pyre/
 .pytype/
+.cache/
 
 # --- Coverage & test outputs ---
 .coverage
@@ -61,4 +62,9 @@ data/raw_pdfs/
 data/extracted_text/
 outputs/
 
-
+tmp_fincen_pdfs/
+fincen_alert_pdfs/
+tmp_fincen_pdfs/
+processing_state.json
+embed_cache.json
+.cache/
