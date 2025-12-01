@@ -218,7 +218,7 @@ Three main tabs:
 
 ---
 
-# 🔍 4. Findings (What We Learned)
+# 🔍 Findings (What We Learned)
 
 ### **Why This Matters for AML / Financial Crime**
 
@@ -290,4 +290,5 @@ Analysts can ask questions like:
 ├── pyproject.toml
 └── README.md
 ```
+
 
