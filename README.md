@@ -1,293 +1,293 @@
 # **FinCEN Fraud Intelligence Platform**
 
-### **Turning 30 years of FinCEN data into a searchable fraud-analysis engine.**
+### **Turning 30 years of FinCEN publications into a real-time fraud-analysis engine.**
 
 **Authors:**
-
-* Tim Goncharov
-* Mahdi Bahreman 
-* Natalia Herrera
-* Marlon Martin
+Tim Goncharov · Mahdi Bahreman · Natalia Herrera · Marlon Martin
 
 ---
 
-# ⭐ **Summary**
+# **Project Summary (First Impression)**
 
-A full-stack pipeline that scrapes every FinCEN Advisory, Alert, and Notice (1996–2025), extracts text using OCR, summarizes fraud-dense chunks using LLMs, classifies fraud families, and visualizes emerging financial-crime trends in a deployed Streamlit dashboard.
+**A full-stack system that ingests every FinCEN Advisory/Alert/Notice since 1996, extracts text with OCR, summarizes fraud-dense chunks using LLMs, classifies fraud families, stores results in Supabase, and exposes fraud insights through a deployed Streamlit dashboard.**
+
+> *Goal: Provide AML and fraud-risk teams with instant visibility into emerging trends, red flags, and SAR-relevant schemes.*
 
 ---
 
-# ⚡ **Quick Start Guide**
+# **Quick Start (Setup & Running)**
 
-### **Install**
+## **Clone + Install**
 
 ```bash
 uv sync
 ```
 
-(or, if using pip: `pip install -r requirements.txt`)
+Or:
+
+```bash
+pip install -r requirements.txt
+```
 
 ---
 
-### **Run the Pipeline**
+## **Environment Variables**
+
+Create `.env`:
 
 ```bash
-python advisory_crawler.py
-python alerts_notices_crawler.py
+OPENAI_API_KEY="your_key"       # optional (for LLM summaries)
+SUPABASE_URL="your_supabase_url"
+SUPABASE_SERVICE_KEY="your_service_role_key"  # required
+```
+
+(We also provide `.env.example` — fill in and rename to `.env`.)
+
+---
+
+## **Run the Full Pipeline**
+
+```bash
+python fincen_publications_crawler.py
+python fincen_text_extractor.py
 python fincen_ocr_fraud_mapper.py
 python fincen_summary_generator.py
-python json_to_csv_summaries.py
+python fincen_build_fraud_dictionary.py
+python build_vectorstore.py
 ```
+
+Everything populates directly into Supabase:
+
+* documents
+* pages
+* OCR text
+* LLM summaries
+* fraud family mappings
+* embeddings
+* semantic vectorstore
+
+**No CSVs are used in the live pipeline.**
 
 ---
 
-### **Environment Variables**
-
-Create a `.env` file (or `.env.example`) like:
+## **Run the Dashboard**
 
 ```bash
-OPENAI_API_KEY="your_key"
-SUPABASE_URL="your_url"
-SUPABASE_KEY="your_key"
+streamlit run streamlit_app.py
 ```
 
-*(LLM key optional )*
+Or view it on Modal:
+
+👉 **Live Streamlit App:**
+**[https://tjgoncharov--fincen-fraud-analytics-serve-streamlit.modal.run/](https://tjgoncharov--fincen-fraud-analytics-serve-streamlit.modal.run/)**
 
 ---
 
-# 🖥️ **Visuals / Application Design**
+# Visuals / Application Design
 
 ## **Architecture Diagram**
-*“_End-to-End FinCEN Fraud Intelligence Architecture_”*
 
-*<img width="532" height="346" alt="image" src="https://github.com/user-attachments/assets/e2baea62-563b-4309-ad78-297a7c07505a" />*
+<img width="532" height="346" alt="image" src="https://github.com/user-attachments/assets/c2ab3c64-dea0-4384-b6fb-9c932ec29424" />
 
-**Flow:**
-PDF → OCR → Chunking → LLM Summaries → Fraud Mapping (regex + embeddings) → Supabase → Streamlit Dashboard
+
 
 ---
 
-## **Screenshots / UI**
+## **UI Screenshots**
 
-![571555F2-7AC1-457A-B25A-499A4BD61B76](https://github.com/user-attachments/assets/53517ce9-b7dd-4378-9cf9-b73578a8a3a1)
+### **FinCEN Insights Tab**
+
+*(Momentum of fraud families, narrative summaries, top red flags)*
+
+![571555F2-7AC1-457A-B25A-499A4BD61B76_1_105_c](https://github.com/user-attachments/assets/8e5899c7-8775-4736-8562-3f6d7b48d28b)
 
 
-> The FinCEN Insights tab shows a narrative summary of the most active fraud families, emerging schemes, and repeating red flags.
+### **Timeline View**
+
+*(Counts fraud families per year 1996–2025)*
+
+![5F54EAAF-BF20-46FA-AB3F-31B382A4C37E_1_105_c](https://github.com/user-attachments/assets/cea40e33-c37f-4a15-8ef3-95a33c7abcc7)
+
+
+### **Semantic Search**
+
+*(Embedding-powered search across all FinCEN text)*
+
+![E4B3962F-0FF3-4FB5-86E3-D44B2960CE08_1_105_c](https://github.com/user-attachments/assets/282ccb8c-1775-4be6-8ae5-2a09404f8139)
+
 
 ---
 
-## **Demo Link**
+## **What We Did (with code snippets)**
 
-👉 **Live Streamlit App (deployed on Modal):**
-**https://tjgoncharov--fincen-fraud-analytics-serve-streamlit.modal.run/**
+### **🔹 1. Unified Crawler**
 
----
-
-# What We Did 
-
-Break down of the pipeline with **short explanations + visual snippets**, matching rubric expectations.
-
----
-
-## **🔎 1. Crawling FinCEN PDFs**
-
-Scripts:
-
-* `advisory_crawler.py`
-* `alerts_notices_crawler.py`
-
-**Snippet:**
+Replaces two old crawlers → now one job:
 
 ```python
 records.append({
-    "date": date_str,
+    "doc_id": doc_id,
     "title": title,
-    "url": pdf_url
+    "pub_type": pub_type,
+    "pdf_url": pdf_url,
+    "published": published_date
 })
 ```
 
-**Output sample (`fincen_advisories.csv`):**
-
-| date       | title                       | url          |
-| ---------- | --------------------------- | ------------ |
-| 2024-03-15 | FinCEN Issues Advisory on X | https://…pdf |
+Stored in Supabase table: `documents`.
 
 ---
 
-##  2. OCR + Text Extraction
-
-We used **PyMuPDF + OCR fallback** to extract layout-aware text from each PDF.
+### **🔹 2. OCR + Page-Level Extraction**
 
 ```python
 text = page.get_text("text")
+if not text.strip():
+    text = ocr_page_image(page)
 ```
 
-**Output (`raw_text`):**
-
-```
-Multiple P2P payments received from unrelated accounts ...
-Funds transferred rapidly across jurisdictions ...
-```
+Stored in `pages` table.
 
 ---
 
-## 3. Semantic Chunking
+### **🔹 3. Chunking Strategy (Aha Moment)**
 
-Using **SentenceTransformers**, we created ~500-token chunks to avoid summarizing irrelevant pages.
-
-**Aha moment:**
-👉 *Chunking before summarization reduced LLM cost massively.*
+➡️ **Chunk first, summarize only fraud-dense chunks**
+This lowered LLM usage by **70–85%**.
 
 ```python
-emb = model.encode(chunks)
+chunks = semantic_chunk(page_text, max_tokens=400)
 ```
 
 ---
 
-## 4. LLM Structured Summaries
+### **🔹 4. LLM Summaries**
 
-Each chunk is summarized into this schema:
+Each chunk becomes a structured JSON summary:
 
 ```json
 {
   "primary_fraud_family": "money_laundering",
-  "secondary_fraud_families": ["smuggling"],
-  "key_schemes": ["cross-border mule activity"],
-  "key_red_flags": ["multiple P2P deposits then rapid withdrawals"],
-  "sar_guidance": "Identify unhosted wallet transfers..."
+  "secondary_fraud_families": ["sanctions_evasion"],
+  "key_schemes": ["shell company layering", "cross-border mules"],
+  "key_red_flags": ["large P2P transfers followed by crypto conversion"]
 }
 ```
 
-Saved to `fincen_summaries.json`.
+Stored in `summaries` table.
 
 ---
 
-## 5. Fraud Label Mapping
-
-We combined:
-
-* Regex (high-precision tags)
-* Embeddings (semantic concepts)
-
-**Snippet:**
+### **🔹 5. Fraud Dictionary (Regex + Semantic)**
 
 ```python
-if re.search(pattern, text, re.I):
-    labels.append("sanctions_evasion")
+if re.search(r"unhosted wallet", text, re.I):
+    labels.append("crypto_virtual_assets")
 ```
 
----
+The team-built fraud dictionary contains:
 
-## 6. Supabase Storage
-
-Tables:
-
-| Table           | Description        |
-| --------------- | ------------------ |
-| `documents`     | PDF metadata       |
-| `chunks`        | OCR’d chunk text   |
-| `embeddings`    | vector embeddings  |
-| `summaries`     | LLM JSON summaries |
-| `fraud_mapping` | final fraud labels |
+* fraud families
+* synonyms
+* indicators
+* semantic keywords
 
 ---
 
-## 📊 7. Visual Dashboard (Streamlit)
+### **🔹 6. Embeddings + Vectorstore**
 
-Tabs include:
+```python
+vec = model.encode(chunk_text)
+supabase.table("embeddings").insert(...)
+```
 
-* **FinCEN Insights**
-* **Fraud Families Timeline**
-* **Semantic Search**
-* **Document Drill-Down**
+Used for:
 
-![5F54EAAF-BF20-46FA-AB3F-31B382A4C37E](https://github.com/user-attachments/assets/0f19394a-6efb-4459-9ef2-051be20cb6d9)
-![1F13C882-942A-4BC5-8EEC-73B7EC084EDB](https://github.com/user-attachments/assets/fe3306c7-8c3c-41fe-b4bd-6f24e854c547)
+* semantic search tab
+* “find similar fraud patterns”
+
+---
+
+### **🔹 7. Streamlit Dashboard**
+
+Three main tabs:
+
+✔ **FinCEN Insights** — narrative summaries
+✔ **Fraud Families Timeline** — trend visualization
+✔ **Semantic Search** — embedding similarity
+
+---
+
+# 🔍 4. Findings (What We Learned)
+
+### **Why This Matters for AML / Financial Crime**
+
+FinCEN documents are long, dense, and inconsistent.
+Our system:
+
+✔ Identifies emerging fraud patterns before humans see them
+✔ Centralizes 30 years of guidance
+✔ Surfaces SAR-ready red flags
+✔ Tracks geopolitical fraud trends (ML, sanctions, TF, crypto)
+✔ Enables instant semantic retrieval of intelligence
+
+---
+
+## **Top Fraud Families (Counts Across 30 Years)**
+
+*Money laundering dominates the corpus.*
+Crypto-related fraud spikes since 2018.
+Sanctions evasion correlates with geopolitical events.
+
+![5E2C402F-F7C3-48E5-98D9-3A35A4A3A7DC_4_5005_c](https://github.com/user-attachments/assets/87a1b21f-3a40-460b-8b01-f561aff5b757)
 
 
 ---
 
-# 🔍 Findings 
+## **Fraud Intensity Over Time**
 
-## Why Analysts Care
+Shows per-year spikes in:
 
-FinCEN publishes huge PDFs that are slow for AML teams to digest.
-Our tool provides:
+* terrorist financing
+* corruption
+* human trafficking
+* ransomware
+* crypto/virtual asset scams
 
-✔ **Fast identification of active fraud families**
-✔ **Emerging scheme detection**
-✔ **Red-flag extraction for SAR writing**
-✔ **Historical trend analysis (1996–2025)**
-✔ **Semantic search to find relevant guidance instantly**
+![9D0BF9B5-5718-4BDC-AE6E-AAB36625F50C_1_105_c](https://github.com/user-attachments/assets/c0692c34-2b83-488b-8c4c-19d52b23f39d)
+
 
 ---
 
-## Key Visual Findings 
+## **Semantic Search Insights**
 
-### **Top Fraud Labels (Counts)**
+Analysts can ask questions like:
 
-![5E2C402F-F7C3-48E5-98D9-3A35A4A3A7DC](https://github.com/user-attachments/assets/6eb7a08a-4823-4d75-a34b-139cdc4913af)
+*“P2P mule typologies 2024”*
+*“shell company Russian sanctions guidance”*
+*“romance scam SAR indicators”*
 
-
-**Observed:**
-
-* Money laundering dominates the dataset (~5k signals).
-* Terrorist financing & sanctions evasion have strong cyclical spikes.
-* Cybercrime and crypto-related schemes rise sharply after 2018.
+…and instantly retrieve relevant FinCEN text.
 
 ---
 
-### **Fraud Intensity Over Time**
-
-![9D0BF9B5-5718-4BDC-AE6E-AAB36625F50C](https://github.com/user-attachments/assets/a72a3ef9-d01c-4c99-8df4-e2ed87536284)
-
-**Insights:**
-
-* Sanctions evasion surges around geopolitical events (2014, 2022).
-* Human trafficking becomes more prominently flagged post-2020.
-* Crypto/virtual asset fraud spikes in 2018 and remains elevated.
-
----
-
-### **Semantic Search Discovery**
-
-![E4B3962F-0FF3-4FB5-86E3-D44B2960CE08](https://github.com/user-attachments/assets/62b10147-0405-4a07-9e42-6ef6ba510caf)
-
-
-Analysts can query:
-
-* *“money laundering”*
-* *“unhosted wallets sanctions”*
-* *“mule typologies 2024”*
-
-And instantly retrieve the most relevant chunks.
-
----
-
-# 📁 **Folder Structure**
+# Folder Structure 
 
 ```bash
 .
-├── advisory_crawler.py
-├── alerts_notices_crawler.py
+├── fincen_publications_crawler.py
+├── fincen_text_extractor.py
 ├── fincen_ocr_fraud_mapper.py
 ├── fincen_summary_generator.py
-├── json_to_csv_summaries.py
-├── data/
-│   ├── fincen_advisories.csv
-│   ├── fincen_alerts.csv
-│   ├── fincen_keyword_locations.csv
-│   ├── fincen_summary_summaries.json
+├── fincen_build_fraud_dictionary.py
+├── build_vectorstore.py
+├── semantic_search.py
+├── supabase_helpers.py
 ├── streamlit_app.py
+├── modal_app.py
+├── vecstore/
 ├── requirements.txt
+├── pyproject.toml
 └── README.md
-```
-
----
-
-# 🧪 **Run the Dashboard Locally**
-
-```bash
-streamlit run streamlit_app.py
 ```
 
