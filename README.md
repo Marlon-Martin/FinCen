@@ -81,7 +81,7 @@ Or view it on Modal:
 
 ## **Architecture Diagram**
 
-<img width="750" height="600" alt="image" src="https://github.com/user-attachments/assets/c2ab3c64-dea0-4384-b6fb-9c932ec29424" />
+<img width="750" height="600" alt="architecture" src="https://github.com/user-attachments/assets/f45109b7-4d62-4647-b798-876e7cf1e8a6" />
 
 
 
@@ -322,5 +322,6 @@ Analysts can ask questions like:
 ├── pyproject.toml
 └── README.md
 ```
+
 
 
