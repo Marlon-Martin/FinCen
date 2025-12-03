@@ -1468,6 +1468,15 @@ def tab_fincen_insights(docs_df: pd.DataFrame):
         doc_type = row.get("doc_type") or ""
         fincen_id = row.get("fincen_id")
 
+        # Prefer direct pdf_url, fall back to detail_url
+        pdf_url = row.get("pdf_url")
+        detail_url = row.get("detail_url")
+        pdf_link = None
+        if isinstance(pdf_url, str) and pdf_url.strip():
+            pdf_link = pdf_url.strip()
+        elif isinstance(detail_url, str) and detail_url.strip():
+            pdf_link = detail_url.strip()
+
         header_line = f"**{title}**"
         meta_bits = []
         if isinstance(doc_date, pd.Timestamp) and not pd.isna(doc_date):
@@ -1478,6 +1487,9 @@ def tab_fincen_insights(docs_df: pd.DataFrame):
             meta_bits.append(f"*Type:* {doc_type}")
         if fincen_id:
             meta_bits.append(f"*FinCEN ID:* `{fincen_id}`")
+        if pdf_link:
+            # Markdown hyperlink to the PDF
+            meta_bits.append(f"[Open PDF]({pdf_link})")
 
         st.markdown(header_line)
         if meta_bits:
@@ -1490,6 +1502,7 @@ def tab_fincen_insights(docs_df: pd.DataFrame):
             st.write("_No high-level summary available for this document._")
 
         st.markdown("---")
+
 
 
 # ---------------------------------------------------------------------------
