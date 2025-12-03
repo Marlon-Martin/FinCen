@@ -5,16 +5,15 @@ FinCEN Fraud Families Timeline + Drill-Down App (Supabase + Semantic Search)
 
 Views:
 
-  1) Fraud Families Over Time
-     - How often each fraud family appears by year.
-     - Powered by primary_fraud_families + secondary_fraud_families.
+  1) FinCEN Insights
+     - High-level narrative + simple analytics over recent FinCEN publications.
 
-  2) Semantic Search
+  2) Fraud Families Timeline
+     - How often each fraud family appears by year, with drill-down into documents.
+
+  3) Semantic Search
      - Embedding-based search over pre-chunked FinCEN texts stored locally
        in vecstore/ (built via build_vectorstore.py).
-
-  3) FinCEN Insights
-     - High-level narrative + simple analytics over recent FinCEN publications.
 """
 
 from __future__ import annotations
@@ -25,10 +24,10 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 import json
-from datetime import datetime, timedelta  # NEW: for time-window filtering
+from datetime import datetime, timedelta
 
 from supabase_helpers import get_supabase_client
-from semantic_search import search as semantic_search  # NEW: semantic search API
+from semantic_search import search as semantic_search
 
 
 st.set_page_config(
@@ -37,9 +36,30 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ---------------------------------------------------------------------------
+# Global styling tweaks (more padding, wrap long text in dataframes)
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    """
+    <style>
+    /* Slightly reduce top padding and give consistent feel */
+    .main > div {
+        padding-top: 0.75rem;
+    }
+    /* Wrap long text inside dataframes instead of truncating */
+    .stDataFrame tbody td {
+        white-space: normal !important;
+        word-wrap: break-word !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ---------------------------------------------------------------------------
-# Data loading from Supabase
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -74,29 +94,69 @@ def _ensure_list(val: Any) -> List[Any]:
     return [val]
 
 
+def _extract_scheme_labels(val: Any) -> List[str]:
+    """
+    Normalize specific_schemes into a flat list of scheme labels.
+
+    Handles:
+      - list of dicts with 'scheme_label' / 'label' / 'name'
+      - list of strings
+      - JSON-encoded strings
+      - semicolon / pipe separated strings
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return []
+
+    # Already a list
+    if isinstance(val, list):
+        labels: List[str] = []
+        for item in val:
+            if isinstance(item, dict):
+                label = (
+                    item.get("scheme_label")
+                    or item.get("label")
+                    or item.get("name")
+                )
+                if label:
+                    labels.append(str(label).strip())
+            elif isinstance(item, str):
+                s = item.strip()
+                if s:
+                    labels.append(s)
+        return labels
+
+    # Try JSON decode from string
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            return _extract_scheme_labels(parsed)
+        except Exception:
+            # Fallback: split on common separators
+            parts = [p.strip() for p in s.replace(";", "|").split("|")]
+            return [p for p in parts if p]
+
+    # Fallback: single value
+    return [str(val).strip()]
+
+
+# ---------------------------------------------------------------------------
+# Data loading from Supabase
+# ---------------------------------------------------------------------------
+
+
 def load_data_from_supabase() -> pd.DataFrame:
     """
     Load summaries + publication metadata from Supabase and return a single
     DataFrame with one row per document.
-
-    Columns will include:
-      - doc_key
-      - doc_title
-      - doc_date
-      - year
-      - doc_type
-      - fincen_id (if present)
-      - high_level_summary
-      - primary_fraud_families (list)
-      - secondary_fraud_families (list)
-      - specific_schemes (list[dict] or list[str])
-      - key_red_flags (list[str])
     """
     client = get_supabase_client()
 
     # Summaries table (LLM output)
     summaries_resp = client.table("fincen_llm_summaries").select(
-        "doc_key, title, doc_type, date, "
+        "doc_key, title, doc_type, date, created_at, "
         "high_level_summary, "
         "primary_fraud_families, secondary_fraud_families, "
         "specific_schemes, key_red_flags"
@@ -121,6 +181,12 @@ def load_data_from_supabase() -> pd.DataFrame:
         summaries_df["doc_date"], errors="coerce"
     )
     summaries_df["year"] = summaries_df["doc_date_parsed"].dt.year
+
+    # Parse LLM summary creation time (timestamptz → datetime)
+    if "created_at" in summaries_df.columns:
+        summaries_df["created_at_parsed"] = pd.to_datetime(
+            summaries_df["created_at"], errors="coerce"
+        )
 
     # Publications table (metadata)
     pubs_resp = client.table("fincen_publications").select(
@@ -194,20 +260,18 @@ def explode_families(docs_df: pd.DataFrame) -> pd.DataFrame:
 def sidebar_filters(docs_df: pd.DataFrame) -> dict:
     """
     Build the sidebar controls and return a dict of selected filters + modes.
-    We use docs_df (one row per doc); the actual exploded view is built later
-    depending on the "primary only" vs "primary + secondary" toggle.
     """
-    st.sidebar.header("Filters")
+    st.sidebar.subheader("Filters")
 
     # Toggle: count only primary families vs primary+secondary
     family_source_mode = st.sidebar.radio(
-        "Which fraud families to count?",
+        "Fraud family source",
         options=["Primary only", "Primary + Secondary"],
         index=1,
         help=(
             "• Primary only: each document contributes only to its primary_fraud_families.\n"
-            "• Primary + Secondary: a document contributes to any family listed as primary "
-            "or secondary (this was the original behavior)."
+            "• Primary + Secondary: a document contributes to any family listed as "
+            "primary or secondary."
         ),
     )
 
@@ -224,11 +288,6 @@ def sidebar_filters(docs_df: pd.DataFrame) -> dict:
         "Fraud family mode",
         options=["Manual selection", "Top N overall", "Top N per year"],
         index=0,
-        help=(
-            "- **Manual selection**: Pick one or more fraud families.\n"
-            "- **Top N overall**: Take the top N families (by doc count over the entire range).\n"
-            "- **Top N per year**: For each year, pick the top N families independently."
-        ),
     )
 
     selected_families: List[str] = []
@@ -244,7 +303,7 @@ def sidebar_filters(docs_df: pd.DataFrame) -> dict:
         max_n = len(all_families) or 1
         default_n = min(10, max_n)
         top_n = st.sidebar.slider(
-            "Number of fraud families to show (Top N)",
+            "Number of fraud families (Top N)",
             min_value=1,
             max_value=max_n,
             value=default_n,
@@ -278,7 +337,7 @@ def sidebar_filters(docs_df: pd.DataFrame) -> dict:
         year_range = None
 
     filters = {
-        "family_source_mode": family_source_mode,  # primary-only vs primary+secondary
+        "family_source_mode": family_source_mode,
         "family_mode": family_mode,
         "selected_families": selected_families,
         "top_n": top_n,
@@ -313,10 +372,6 @@ def filter_exploded_with_family_mode(
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     Apply filters to exploded_docs depending on the selected fraud family mode.
-
-    Returns:
-        filtered_exploded: exploded_docs filtered by year, doc_type, and family logic
-        active_families: list of fraud families that are still in play
     """
     mode = filters.get("family_mode", "Manual selection")
 
@@ -435,13 +490,11 @@ def extract_year_and_family_from_event(
 
 
 def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
-    st.subheader("Fraud Families Over Time")
+    st.subheader("Fraud Families Timeline")
 
     src_mode = filters.get("family_source_mode", "Primary + Secondary")
     if src_mode == "Primary only":
-        src_caption = (
-            "Each document contributes only to the fraud families listed as **primary**."
-        )
+        src_caption = "Each document contributes only to **primary** fraud families."
     else:
         src_caption = (
             "Each document contributes to any fraud family listed as **primary or secondary**."
@@ -449,16 +502,139 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
 
     st.markdown(
         f"""
-        This view shows how often each **fraud family** appears in FinCEN publications
-        over time.
+        Use this view to see how **fraud families** show up across FinCEN Advisories,
+        Alerts, and Notices over time.
 
         {src_caption}
-
-        Counts are aggregated across Advisories, Alerts, and Notices.
-
-        👉 Click a bar in the chart to see the **documents** for that (year, fraud family).
         """
     )
+
+    # ------------------------------------------------------------------
+    # High-level summary for current filters (time range + doc type)
+    # ------------------------------------------------------------------
+    base_for_summary = apply_filters_base(exploded_docs, filters)
+
+    if "doc_key" in base_for_summary.columns:
+        base_docs = base_for_summary.drop_duplicates(subset=["doc_key"]).copy()
+    else:
+        base_docs = base_for_summary.copy()
+
+    total_pubs = (
+        base_docs["doc_key"].nunique()
+        if "doc_key" in base_docs.columns
+        else len(base_docs)
+    )
+
+    advisory_count = alert_count = notice_count = 0
+    if "doc_type" in base_docs.columns:
+        raw_counts = (
+            base_docs.groupby("doc_type")["doc_key"]
+            .nunique()
+            .to_dict()
+        )
+        normalized_counts: Dict[str, int] = {}
+        for k, v in raw_counts.items():
+            if not k:
+                continue
+            key_norm = str(k).strip().lower()
+            normalized_counts[key_norm] = normalized_counts.get(key_norm, 0) + int(v)
+
+        advisory_count = normalized_counts.get("advisory", 0)
+        alert_count = normalized_counts.get("alert", 0)
+        notice_count = normalized_counts.get("notice", 0)
+
+    # Last LLM summary update based on created_at (timestamptz)
+    last_created_at = None
+    if "created_at_parsed" in base_docs.columns:
+        last_created_at = base_docs["created_at_parsed"].max()
+    elif "created_at" in base_docs.columns:
+        tmp_created = pd.to_datetime(base_docs["created_at"], errors="coerce")
+        if tmp_created.notna().any():
+            last_created_at = tmp_created.max()
+
+    if isinstance(last_created_at, pd.Timestamp) and not pd.isna(last_created_at):
+        last_updated_str = last_created_at.strftime("%Y-%m-%d")
+    else:
+        last_updated_str = "N/A"
+
+    # Top schemes for this filtered slice (based on specific_schemes)
+    scheme_counts_top5 = None
+    if "specific_schemes" in base_docs.columns:
+        tmp = base_docs.copy()
+        tmp["__scheme_labels_timeline"] = tmp["specific_schemes"].apply(
+            _extract_scheme_labels
+        )
+        scheme_series = (
+            tmp["__scheme_labels_timeline"]
+            .explode()
+            .dropna()
+            .astype(str)
+            .str.strip()
+        )
+        scheme_series = scheme_series[scheme_series != ""]
+        if not scheme_series.empty:
+            scheme_counts_top5 = scheme_series.value_counts().head(5)
+
+    # Summary pills
+    st.markdown(
+        f"""
+        <div style="
+            display:flex;
+            flex-wrap:wrap;
+            gap:0.4rem;
+            margin:0.5rem 0 1rem 0;
+        ">
+          <div style="
+              padding:0.35rem 0.75rem;
+              border-radius:999px;
+              background-color:#0f172a;
+              color:white;
+              font-size:0.85rem;
+          ">
+            Total publications (current filters): <b>{total_pubs}</b>
+          </div>
+          <div style="
+              padding:0.35rem 0.75rem;
+              border-radius:999px;
+              background-color:#e5e7eb;
+              color:#111827;
+              font-size:0.85rem;
+          ">
+            Advisories: <b>{advisory_count}</b>
+          </div>
+          <div style="
+              padding:0.35rem 0.75rem;
+              border-radius:999px;
+              background-color:#e5e7eb;
+              color:#111827;
+              font-size:0.85rem;
+          ">
+            Alerts: <b>{alert_count}</b>
+          </div>
+          <div style="
+              padding:0.35rem 0.75rem;
+              border-radius:999px;
+              background-color:#e5e7eb;
+              color:#111827;
+              font-size:0.85rem;
+          ">
+            Notices: <b>{notice_count}</b>
+          </div>
+          <div style="
+              padding:0.35rem 0.75rem;
+              border-radius:999px;
+              background-color:#f97316;
+              color:white;
+              font-size:0.85rem;
+          ">
+            Last LLM summary update (created_at): <b>{last_updated_str}</b>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
 
     mode = filters.get("family_mode", "Manual selection")
     top_n = max(1, int(filters.get("top_n", 10)))
@@ -486,7 +662,7 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
 
         num_docs = focus_docs["doc_key"].nunique()
         badge_text = (
-            f"Showing {num_docs} document{'s' if num_docs != 1 else ''} "
+            f"{num_docs} document{'s' if num_docs != 1 else ''} "
             f"for {selected_family} ({selected_year})"
         )
         st.markdown(
@@ -497,27 +673,73 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
         )
 
         st.markdown(
-            f"### Articles for **{selected_family}** in **{selected_year}**{label_suffix}"
+            f"#### Articles for **{selected_family}** in **{selected_year}**{label_suffix}"
         )
 
+        # Build a pdf_link column (prefer pdf_url, then detail_url)
+        focus_docs = focus_docs.copy()
+        pdf_url_col = focus_docs.get("pdf_url")
+        detail_url_col = focus_docs.get("detail_url")
+
+        def _pick_link(idx):
+            pdf_val = pdf_url_col.iloc[idx] if pdf_url_col is not None else None
+            det_val = detail_url_col.iloc[idx] if detail_url_col is not None else None
+            if isinstance(pdf_val, str) and pdf_val.strip():
+                return pdf_val.strip()
+            if isinstance(det_val, str) and det_val.strip():
+                return det_val.strip()
+            return None
+
+        if pdf_url_col is not None or detail_url_col is not None:
+            focus_docs["pdf_link"] = [
+                _pick_link(i) for i in range(len(focus_docs))
+            ]
+        else:
+            focus_docs["pdf_link"] = None
+
+        # Clean, non-redundant columns (no year/doc_key)
         display_cols = [
             "doc_date",
-            "year",
             "fincen_id",
             "doc_type",
             "doc_title",
-            "doc_key",
             "primary_fraud_families",
             "secondary_fraud_families",
+            "pdf_link",
         ]
         available_cols = [c for c in display_cols if c in focus_docs.columns]
 
         table_df = (
             focus_docs[available_cols]
-            .sort_values(["doc_date", "doc_key"], na_position="last")
+            .sort_values(["doc_date", "doc_title"], na_position="last")
             .reset_index(drop=True)
         )
-        st.dataframe(table_df, use_container_width=True)
+
+        # Friendly column labels
+        rename_map = {
+            "doc_date": "Date",
+            "fincen_id": "FinCEN ID",
+            "doc_type": "Type",
+            "doc_title": "Title",
+            "primary_fraud_families": "Primary fraud families",
+            "secondary_fraud_families": "Secondary fraud families",
+            "pdf_link": "PDF",
+        }
+        table_df = table_df.rename(columns=rename_map)
+
+        # Use data_editor so we can have a LinkColumn for the PDF
+        st.data_editor(
+            table_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=True,
+            column_config={
+                "PDF": st.column_config.LinkColumn(
+                    "Open PDF",
+                    display_text="Open",
+                ),
+            },
+        )
 
         # Article-level summary viewer
         focus_docs_sorted = (
@@ -527,7 +749,7 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
         if focus_docs_sorted.empty:
             return
 
-        st.markdown("#### View LLM summary for a specific article")
+        st.markdown("##### LLM summary for a selected article")
 
         option_labels = []
         for _, row in focus_docs_sorted.iterrows():
@@ -546,8 +768,6 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
         )
 
         selected_row = focus_docs_sorted.iloc[selected_idx]
-
-        st.markdown("##### LLM-generated summary")
 
         if pd.notna(selected_row.get("high_level_summary", None)):
             st.markdown("**High-level summary**")
@@ -600,11 +820,20 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
                             if k in schemes_df.columns
                         }
                     )
-                    st.dataframe(schemes_df, use_container_width=True)
+                    # Re-order to Scheme label → Fraud family → Description → Notes
+                    desired_order = [
+                        "Scheme label",
+                        "Fraud family",
+                        "Description",
+                        "Notes",
+                    ]
+                    cols_in_df = [c for c in desired_order if c in schemes_df.columns]
+                    schemes_df = schemes_df[cols_in_df]
+                    st.dataframe(schemes_df, use_container_width=True, hide_index=True)
                 else:
                     st.write("No structured schemes available.")
 
-    # Top N per year mode
+    # ----------------------- Top N per year mode -----------------------
     if mode == "Top N per year":
         base = apply_filters_base(exploded_docs, filters)
         if base.empty:
@@ -631,7 +860,7 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
 
         st.caption(
             f"For each year, showing fraud families that are in the Top {top_n} "
-            f"by document count for that year. Families can change year-to-year."
+            f"by document count for that year."
         )
 
         selector = alt.selection_point(
@@ -639,6 +868,7 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
             fields=["year", "fraud_family"],
         )
 
+        # Main timeline chart
         chart = (
             alt.Chart(counts_top)
             .mark_bar()
@@ -654,7 +884,7 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
                 ],
             )
             .add_params(selector)
-            .properties(height=450)
+            .properties(height=420)
         )
 
         event = st.altair_chart(
@@ -665,26 +895,96 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
             key="fraud_families_chart_top_per_year",
         )
 
+        # Drill-down (between main chart and secondary charts)
         selected_year, selected_family = extract_year_and_family_from_event(
             event, selection_name="fraud_point"
         )
-
         _render_drilldown_table(
             base, selected_year, selected_family, label_suffix=" (Top N per year mode)"
         )
+
+        st.markdown("---")
+
+        # Totals bar chart (aggregated over years for the current filters)
+        totals = (
+            counts_top.groupby("fraud_family", dropna=True)["docs"]
+            .sum()
+            .reset_index(name="total_docs")
+        )
+        if not totals.empty:
+            st.markdown("#### Total documents by fraud family (current filters)")
+
+            family_sel = alt.selection_point(
+                "family_totals_top",
+                fields=["fraud_family"],
+            )
+
+            totals_chart = (
+                alt.Chart(totals)
+                .mark_bar()
+                .encode(
+                    x=alt.X("total_docs:Q", title="Total documents"),
+                    y=alt.Y("fraud_family:N", sort="-x", title="Fraud family"),
+                    opacity=alt.condition(family_sel, alt.value(1.0), alt.value(0.3)),
+                    tooltip=[
+                        alt.Tooltip("fraud_family:N", title="Fraud family"),
+                        alt.Tooltip("total_docs:Q", title="Total documents"),
+                    ],
+                )
+                .add_params(family_sel)
+                .properties(height=280)
+            )
+
+            st.altair_chart(
+                totals_chart,
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="family_totals_top",
+                key="fraud_totals_chart_top_per_year",
+            )
+
+        # Top schemes chart (current filters, max 5)
+        if scheme_counts_top5 is not None and not scheme_counts_top5.empty:
+            st.markdown("#### Top schemes (current filters, max 5)")
+            schemes_df = (
+                scheme_counts_top5.reset_index()
+                .rename(columns={"index": "Scheme", 0: "count"})
+            )
+            schemes_df.columns = ["Scheme", "count"]
+
+            schemes_chart = (
+                alt.Chart(schemes_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("count:Q", title="Number of mentions"),
+                    y=alt.Y("Scheme:N", sort="-x", title="Scheme"),
+                    tooltip=["Scheme", "count"],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(schemes_chart, use_container_width=True)
+
         return
 
-    # Manual / Top N overall
+    # ---------------- Manual / Top N overall modes ----------------
     filtered, active_families = filter_exploded_with_family_mode(exploded_docs, filters)
 
     if filtered.empty or not active_families:
         st.info("No documents match the current filters.")
         return
 
-    st.caption(
-        "Only documents whose primary or secondary fraud families intersect with the "
-        "selected families (or Top N overall) are included below."
-    )
+    if filters.get("family_source_mode") == "Primary only":
+        cap_text = (
+            "Only documents whose **primary fraud families** intersect with the "
+            "selected families (or Top N overall) are included below."
+        )
+    else:
+        cap_text = (
+            "Only documents whose **primary or secondary fraud families** intersect "
+            "with the selected families (or Top N overall) are included below."
+        )
+
+    st.caption(cap_text)
 
     counts = (
         filtered.groupby(["year", "fraud_family"], dropna=True)
@@ -701,6 +1001,7 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
         fields=["year", "fraud_family"],
     )
 
+    # Main timeline chart
     chart = (
         alt.Chart(counts)
         .mark_bar()
@@ -716,7 +1017,7 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
             ],
         )
         .add_params(selector)
-        .properties(height=450)
+        .properties(height=420)
     )
 
     event = st.altair_chart(
@@ -727,16 +1028,77 @@ def tab_fraud_families_over_time(exploded_docs: pd.DataFrame, filters: dict):
         key="fraud_families_chart_manual_top_overall",
     )
 
+    # Drill-down (between main chart and secondary charts)
     selected_year, selected_family = extract_year_and_family_from_event(
         event, selection_name="fraud_point"
     )
-
     _render_drilldown_table(
         filtered,
         selected_year,
         selected_family,
         label_suffix=" (Manual / Top N overall mode)",
     )
+
+    st.markdown("---")
+
+    # Totals bar chart for current filters (manual / top N overall)
+    totals = (
+        counts.groupby("fraud_family", dropna=True)["docs"]
+        .sum()
+        .reset_index(name="total_docs")
+    )
+    if not totals.empty:
+        st.markdown("#### Total documents by fraud family (current filters)")
+
+        family_sel = alt.selection_point(
+            "family_totals_manual",
+            fields=["fraud_family"],
+        )
+
+        totals_chart = (
+            alt.Chart(totals)
+            .mark_bar()
+            .encode(
+                x=alt.X("total_docs:Q", title="Total documents"),
+                y=alt.Y("fraud_family:N", sort="-x", title="Fraud family"),
+                opacity=alt.condition(family_sel, alt.value(1.0), alt.value(0.3)),
+                tooltip=[
+                    alt.Tooltip("fraud_family:N", title="Fraud family"),
+                    alt.Tooltip("total_docs:Q", title="Total documents"),
+                ],
+            )
+            .add_params(family_sel)
+            .properties(height=280)
+        )
+
+        st.altair_chart(
+            totals_chart,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="family_totals_manual",
+            key="fraud_totals_chart_manual_top_overall",
+        )
+
+    # Top schemes chart (current filters, max 5)
+    if scheme_counts_top5 is not None and not scheme_counts_top5.empty:
+        st.markdown("#### Top schemes (current filters, max 5)")
+        schemes_df = (
+            scheme_counts_top5.reset_index()
+            .rename(columns={"index": "Scheme", 0: "count"})
+        )
+        schemes_df.columns = ["Scheme", "count"]
+
+        schemes_chart = (
+            alt.Chart(schemes_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("count:Q", title="Number of mentions"),
+                y=alt.Y("Scheme:N", sort="-x", title="Scheme"),
+                tooltip=["Scheme", "count"],
+            )
+            .properties(height=260)
+        )
+        st.altair_chart(schemes_chart, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -752,17 +1114,16 @@ def tab_semantic_search():
 
     st.markdown(
         """
-        This view runs **embedding-based semantic search** over pre-chunked
-        FinCEN texts stored in the local `vecstore/` directory.
+        Run **embedding-based search** over pre-chunked FinCEN text stored in the
+        local `vecstore/` directory.
 
-        Use it to find passages related to complex fraud patterns, even when
-        exact keywords don't match.
+        Helpful for locating patterns where exact keywords might not match.
         """
     )
 
     query = st.text_input(
         "Search query",
-        placeholder="e.g. 'shell companies used to launder ransomware proceeds'",
+        placeholder="e.g. shell companies used to launder ransomware proceeds",
     )
 
     col1, col2, col3 = st.columns(3)
@@ -770,12 +1131,12 @@ def tab_semantic_search():
         top_k = st.number_input("Top-k results", min_value=1, max_value=50, value=5)
     with col2:
         label_filter = st.text_input(
-            "Filter by fraud label (optional)",
-            placeholder="e.g. 'ransomware', 'elder fraud'",
+            "Fraud label filter (optional)",
+            placeholder="e.g. ransomware, elder fraud",
         )
     with col3:
         article_filter = st.text_input(
-            "Filter by article name (optional)",
+            "Article name filter (optional)",
             placeholder="substring of article_name",
         )
 
@@ -858,76 +1219,16 @@ def tab_semantic_search():
 # ---------------------------------------------------------------------------
 
 
-def _extract_scheme_labels(val: Any) -> List[str]:
-    """
-    Normalize specific_schemes into a flat list of scheme labels.
-
-    Handles:
-      - list of dicts with 'scheme_label' / 'label' / 'name'
-      - list of strings
-      - JSON-encoded strings
-      - semicolon / pipe separated strings
-    """
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return []
-
-    # Already a list
-    if isinstance(val, list):
-        labels: List[str] = []
-        for item in val:
-            if isinstance(item, dict):
-                label = (
-                    item.get("scheme_label")
-                    or item.get("label")
-                    or item.get("name")
-                )
-                if label:
-                    labels.append(str(label).strip())
-            elif isinstance(item, str):
-                s = item.strip()
-                if s:
-                    labels.append(s)
-        return labels
-
-    # Try JSON decode from string
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return []
-        try:
-            parsed = json.loads(s)
-            return _extract_scheme_labels(parsed)
-        except Exception:
-            # Fallback: split on common separators
-            parts = [p.strip() for p in s.replace(";", "|").split("|")]
-            return [p for p in parts if p]
-
-    # Fallback: single value
-    return [str(val).strip()]
-
-
 def tab_fincen_insights(docs_df: pd.DataFrame):
     """
-    FinCEN Insights tab
-
-    Uses only the fincen_llm_summaries-derived columns inside docs_df to:
-      - filter by recent time window,
-      - aggregate fraud families, schemes, red flags,
-      - detect simple "emerging" schemes,
-      - and build a narrative summary plus visuals.
+    FinCEN Insights tab.
     """
     st.subheader("FinCEN Insights")
 
     st.markdown(
         """
-        This tab gives a **quick narrative overview** of recent FinCEN Advisories,
-        Alerts, and Notices based on the LLM summaries stored in Supabase.
-
-        Use it to see:
-        - Which **fraud families** are most active,
-        - Which **schemes** keep showing up,
-        - What **red flags** are repeated across documents,
-        - And which **documents** are most notable in the selected period.
+        Quick snapshot of recent FinCEN publications:
+        top fraud families, schemes, and red flags over a chosen time window.
         """
     )
 
@@ -965,8 +1266,8 @@ def tab_fincen_insights(docs_df: pd.DataFrame):
     ].copy()
 
     st.markdown(
-        f"**Window:** {window_label} "
-        f"({df_recent['doc_key'].nunique()} documents in this period)"
+        f"**Window:** {window_label} — "
+        f"**{df_recent['doc_key'].nunique()}** documents"
     )
 
     if df_recent.empty:
@@ -975,7 +1276,7 @@ def tab_fincen_insights(docs_df: pd.DataFrame):
 
     # --- Step 2: Simple analytics: families, schemes, red flags ---
 
-    # Fraud families (use union of primary + secondary, already in all_families)
+    # Fraud families
     fam_series_recent = (
         df_recent["all_families"]
         .apply(_ensure_list)
@@ -1037,7 +1338,6 @@ def tab_fincen_insights(docs_df: pd.DataFrame):
         total_count = scheme_counts_all.get(scheme, 0)
         if total_count == 0:
             continue
-        # Very simple rule: at least 50% of all occurrences are in this window
         if recent_count / total_count >= 0.5:
             emerging_schemes.append(scheme)
 
@@ -1054,33 +1354,35 @@ def tab_fincen_insights(docs_df: pd.DataFrame):
         f"**{df_recent['doc_key'].nunique()}** documents."
     )
 
+    # Use a compact bullet-style separator instead of commas
+    sep = " • "
+
     if top_families_list:
         narrative_lines.append(
-            f"- The most frequently cited **fraud families** were "
-            f"**{', '.join(top_families_list)}**."
+            f"- Most frequent **fraud families**: "
+            f"**{sep.join(top_families_list)}**."
         )
 
     if top_schemes_list:
         narrative_lines.append(
-            f"- Key **schemes** included "
-            f"**{', '.join(top_schemes_list)}**."
+            f"- Key **schemes**: **{sep.join(top_schemes_list)}**."
         )
 
     if emerging_schemes:
         narrative_lines.append(
-            f"- Potentially **emerging schemes** (heavily concentrated in this window) "
-            f"include **{', '.join(emerging_schemes[:5])}**."
+            f"- Potentially **emerging schemes** (concentrated in this window): "
+            f"**{sep.join(emerging_schemes[:5])}**."
         )
 
     if top_flags_list:
         narrative_lines.append(
-            f"- Repeated **red flags** across multiple publications include "
-            f"**{', '.join(top_flags_list)}**."
+            f"- Repeated **red flags**: "
+            f"**{sep.join(top_flags_list)}**."
         )
 
+
     narrative_lines.append(
-        "These patterns can help analysts prioritize monitoring, SAR reviews, "
-        "and outreach around the most active fraud types and typologies."
+        "Use these patterns to prioritize monitoring, SAR reviews, and outreach."
     )
 
     st.markdown("### Narrative Summary")
@@ -1142,7 +1444,6 @@ def tab_fincen_insights(docs_df: pd.DataFrame):
 
     st.markdown("### Notable Documents in This Window")
 
-    # Simple heuristic: sort by date desc, then by #families+schemes desc
     df_recent = df_recent.copy()
     df_recent["__num_families"] = df_recent["all_families"].apply(
         lambda x: len(_ensure_list(x))
@@ -1161,7 +1462,6 @@ def tab_fincen_insights(docs_df: pd.DataFrame):
         .reset_index(drop=True)
     )
 
-    # Show top 10 "richest" documents
     for _, row in df_notable.head(10).iterrows():
         title = row.get("doc_title") or row.get("doc_key")
         doc_date = row.get("doc_date_parsed") or row.get("doc_date")
@@ -1198,14 +1498,14 @@ def tab_fincen_insights(docs_df: pd.DataFrame):
 
 
 def main():
-    st.title("FinCEN Fraud Families Timeline & Drill-Down")
+    st.title("FinCEN Fraud Intelligence Explorer")
 
     st.markdown(
         """
-        This app visualizes FinCEN Advisories, Alerts, and Notices using
-        **fraud families** extracted from the LLM summaries stored in Supabase,
-        adds an **embedding-based semantic search** view over chunked text,
-        and a **FinCEN Insights** tab for quick, narrative trend analysis.
+        Explore FinCEN Advisories, Alerts, and Notices through:
+        - **Insights**: narrative trends over recent periods  
+        - **Fraud Families Timeline**: yearly counts + drill-down into documents  
+        - **Semantic Search**: embedding-based retrieval over FinCEN chunks
         """
     )
 
@@ -1217,21 +1517,16 @@ def main():
         )
         return
 
-    # Tabs: Insights (first) → Timeline → Semantic Search
     tab1, tab2, tab3 = st.tabs(
         ["FinCEN Insights", "Fraud Families Timeline", "Semantic Search"]
     )
 
-    # --- Tab 1: Insights ---
     with tab1:
         tab_fincen_insights(docs_df)
 
-    # --- Tab 2: Timeline + drill-down ---
     with tab2:
-        # Build filters FIRST (including the primary vs primary+secondary toggle)
         filters = sidebar_filters(docs_df)
 
-        # Depending on the toggle, set which families we explode for counting
         if filters.get("family_source_mode") == "Primary only":
             docs_for_explode = docs_df.copy()
             docs_for_explode["all_families"] = docs_for_explode["primary_fraud_families"]
@@ -1248,7 +1543,6 @@ def main():
         else:
             tab_fraud_families_over_time(exploded, filters)
 
-    # --- Tab 3: Semantic Search ---
     with tab3:
         tab_semantic_search()
 
